@@ -156,6 +156,22 @@ func (c *Container) GetActiveManagers() ([]string, error) {
 	return result, err
 }
 
+func (c *Container) GetManagerFirstDevice(managerId string) (*store.Device, error) {
+	devices, err := c.GetAllManagerDevice(managerId)
+	unlockerror := c.UnlockManagerDevice(managerId)
+	if unlockerror != nil {
+		c.log.Errorf("Unlock device error: %s", unlockerror.Error())
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(devices) == 0 {
+		return c.NewDevice(managerId), nil
+	} else {
+		return devices[0], nil
+	}
+}
+
 func (c *Container) scanDevice(row scannable) (*store.Device, error) {
 	var device store.Device
 	device.DatabaseErrorHandler = c.DatabaseErrorHandler
