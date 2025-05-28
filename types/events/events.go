@@ -42,6 +42,7 @@ type QR struct {
 // wait for the Connected before trying to send anything.
 type PairSuccess struct {
 	ID           types.JID
+	LID          types.JID
 	BusinessName string
 	Platform     string
 }
@@ -49,6 +50,7 @@ type PairSuccess struct {
 // PairError is emitted when a pair-success event is received from the server, but finishing the pairing locally fails.
 type PairError struct {
 	ID           types.JID
+	LID          types.JID
 	BusinessName string
 	Platform     string
 	Error        error
@@ -104,7 +106,8 @@ type LoggedOut struct {
 	// If it's false, the event was triggered by a stream:error message.
 	OnConnect bool
 	// If OnConnect is true, then this field contains the reason code.
-	Reason ConnectFailureReason
+	Reason    ConnectFailureReason
+	ManagerId string
 }
 
 // StreamReplaced is emitted when the client is disconnected by another client connecting with the same keys.
@@ -236,7 +239,9 @@ type StreamError struct {
 }
 
 // Disconnected is emitted when the websocket is closed by the server.
-type Disconnected struct{}
+type Disconnected struct {
+	ManagerId string
+}
 
 // HistorySync is emitted when the phone has sent a blob of historical messages.
 type HistorySync struct {
@@ -436,6 +441,11 @@ type JoinedGroup struct {
 	Reason    string          // If the event was triggered by you using an invite link, this will be "invite".
 	Type      string          // "new" if it's a newly created group.
 	CreateKey types.MessageID // If you created the group, this is the same message ID you passed to CreateGroup.
+	// For type new, the user who created the group and added you to it
+	Sender   *types.JID
+	SenderPN *types.JID
+	Notify   string
+
 	types.GroupInfo
 }
 
@@ -444,6 +454,7 @@ type GroupInfo struct {
 	JID       types.JID  // The group ID in question
 	Notify    string     // Seems like a top-level type for the invite
 	Sender    *types.JID // The user who made the change. Doesn't seem to be present when notify=invite
+	SenderPN  *types.JID // The phone number of the user who made the change, if Sender is a LID.
 	Timestamp time.Time  // The time when the change occurred
 
 	Name      *types.GroupName      // Group name change

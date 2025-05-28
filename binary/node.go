@@ -40,7 +40,7 @@ func (n *Node) UnmarshalJSON(data []byte) error {
 		switch typedVal := val.(type) {
 		case string:
 			parsed, err := types.ParseJID(typedVal)
-			if err == nil && parsed.Server == types.DefaultUserServer || parsed.Server == types.NewsletterServer || parsed.Server == types.GroupServer || parsed.Server == types.BroadcastServer {
+			if err == nil && parsed.Server == types.DefaultUserServer || parsed.Server == types.NewsletterServer || parsed.Server == types.GroupServer || parsed.Server == types.BroadcastServer || parsed.Server == types.HiddenUserServer {
 				mn.Attrs[key] = parsed
 			}
 		case float64:

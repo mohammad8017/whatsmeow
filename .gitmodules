@@ -1,0 +1,3 @@
+[submodule "go-util"]
+	path = go-util
+	url = https://github.com/mautrix/go-util.git
