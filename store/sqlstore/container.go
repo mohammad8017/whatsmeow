@@ -199,8 +199,8 @@ func (c *Container) GetNumberManager(jid types.JID) (string, error) {
 
 
 func (c *Container) GetManagerFirstDevice(managerId string) (*store.Device, error) {
-	devices, err := c.GetAllManagerDevice(managerId)
-	unlockerror := c.UnlockManagerDevice(managerId)
+	devices, _, err := c.GetAllManagerDevice(managerId, 0)
+	unlockerror := c.UnlockManagerDevice(managerId, 0)
 	if unlockerror != nil {
 		c.log.Errorf("Unlock device error: %s", unlockerror.Error())
 	}
@@ -214,7 +214,7 @@ func (c *Container) GetManagerFirstDevice(managerId string) (*store.Device, erro
 	}
 }
 
-func (c *Container) scanDevice(row scannable) (*store.Device, error) {
+func (c *Container) scanDevice(row dbutil.Scannable) (*store.Device, error) {
 	var device store.Device
 	device.Log = c.log
 	device.SignedPreKey = &keys.PreKey{}
