@@ -44,25 +44,22 @@ func (cli *Client) handleEncryptedMessage(node *waBinary.Node) {
 	if err != nil {
 		cli.Log.Warnf("Failed to parse message: %v", err)
 	} else {
-		if info.Chat.Server == types.DefaultUserServer {
-			err = cli.Store.PrekeysCache.PutMessageNode(ctx, info.Chat.User, nil, node)
+		if !info.SenderAlt.IsEmpty() {
+			cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
+		} else if !info.RecipientAlt.IsEmpty() {
+			cli.StoreLIDPNMapping(ctx, info.RecipientAlt, info.Chat)
+		}
+		if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
+			go cli.updateBusinessName(context.WithoutCancel(ctx), info.Sender, info, info.VerifiedName.Details.GetVerifiedName())
+		}
+		if len(info.PushName) > 0 && info.PushName != "-" {
+			go cli.updatePushName(context.WithoutCancel(ctx), info.Sender, info, info.PushName)
+		}
+		if info.Sender.Server == types.NewsletterServer {
+			cli.handlePlaintextMessage(ctx, info, node)
 		} else {
-			err = cli.Store.PrekeysCache.PutMessageNode(ctx, info.Sender.User, &info.Chat.User, node)
+			cli.decryptMessages(ctx, info, node)
 		}
-		if err != nil {
-			cli.Log.Errorf("Failed to insert message node: %v", err)
-		}
-		// if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
-		// 	go cli.updateBusinessName(info.Sender, info, info.VerifiedName.Details.GetVerifiedName())
-		// }
-		// if len(info.PushName) > 0 && info.PushName != "-" {
-		// 	go cli.updatePushName(info.Sender, info, info.PushName)
-		// }
-		// if info.Sender.Server == types.NewsletterServer {
-		// 	cli.handlePlaintextMessage(info, node)
-		// 	} else {
-		// cli.decryptMessages(info, node)
-		// 	}
 		defer cli.maybeDeferredAck(node)()
 	}
 }
