@@ -263,6 +263,12 @@ func (cli *Client) migrateSessionStore(ctx context.Context, pn, lid types.JID) {
 	}
 }
 
+type timeStamping struct {
+	duration time.Duration
+	tag      string
+	section  int
+}
+
 func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo, node *waBinary.Node) (handlerFailed bool) {
 	unavailableNode, ok := node.GetOptionalChildByTag("unavailable")
 	if ok && len(node.GetChildrenByTag("enc")) == 0 {

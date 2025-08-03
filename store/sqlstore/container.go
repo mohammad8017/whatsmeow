@@ -143,14 +143,14 @@ const checkActiveDeviceManagerId = `SELECT 1 FROM whatsmeow_device WHERE manager
 const getDeviceByManagerId = `SELECT jid, lid, registration_id, noise_key, identity_key,
 signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
 adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig,
-platform, business_name, push_name, facebook_uuid, manager_id, locktime
+platform, business_name, push_name, facebook_uuid, lid_migration_ts, manager_id, locktime
 FROM whatsmeow_device
 WHERE manager_id = @p1 AND locktime = @p2`
 
 const getDeviceByManagerIdNoLock = `SELECT jid, lid, registration_id, noise_key, identity_key,
 signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
 adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig,
-platform, business_name, push_name, facebook_uuid, manager_id, locktime
+platform, business_name, push_name, facebook_uuid, lid_migration_ts, manager_id, locktime
 FROM whatsmeow_device
 WHERE manager_id = @p1`
 
