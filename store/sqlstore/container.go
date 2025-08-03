@@ -128,7 +128,7 @@ const getAllDevicesQuery = `
 SELECT jid, lid, registration_id, noise_key, identity_key,
        signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
        adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig,
-       platform, business_name, push_name, facebook_uuid, manager_id
+       platform, business_name, push_name, facebook_uuid, lid_migration_ts, manager_id
 FROM whatsmeow_device
 `
 
@@ -187,7 +187,6 @@ func (c *Container) GetActiveManagers() ([]string, error) {
 	return result, err
 }
 
-
 func (c *Container) GetNumberManager(jid types.JID) (string, error) {
 	var managerId string
 	err := c.db.RawDB.QueryRow(getNumberManager, jid).Scan(&managerId)
@@ -196,7 +195,6 @@ func (c *Container) GetNumberManager(jid types.JID) (string, error) {
 	}
 	return managerId, nil
 }
-
 
 func (c *Container) GetManagerFirstDevice(managerId string) (*store.Device, error) {
 	devices, _, err := c.GetAllManagerDevice(managerId, 0)
@@ -226,7 +224,7 @@ func (c *Container) scanDevice(row dbutil.Scannable) (*store.Device, error) {
 		&device.ID, &device.LID, &device.RegistrationID, &noisePriv, &identityPriv,
 		&preKeyPriv, &device.SignedPreKey.KeyID, &preKeySig,
 		&device.AdvSecretKey, &account.Details, &account.AccountSignature, &account.AccountSignatureKey, &account.DeviceSignature,
-		&device.Platform, &device.BusinessName, &device.PushName, &fbUUID, &device.ManagerId, &device.LockTime)
+		&device.Platform, &device.BusinessName, &device.PushName, &fbUUID, &device.LIDMigrationTimestamp, &device.ManagerId, &device.LockTime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan session: %w", err)
 	} else if len(noisePriv) != 32 || len(identityPriv) != 32 || len(preKeyPriv) != 32 || len(preKeySig) != 64 {
@@ -363,23 +361,24 @@ const (
 		INSERT INTO whatsmeow_device (jid, lid, registration_id, noise_key, identity_key,
 									  signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
 									  adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig,
-									  platform, business_name, push_name, facebook_uuid, manager_id)
-		VALUES (@p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10, @p11, @p12, @p13, @p14, @p15, @p16, @p17, @p18)
+									  platform, business_name, push_name, facebook_uuid, lid_migration_ts, manager_id)
+		VALUES (@p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10, @p11, @p12, @p13, @p14, @p15, @p16, @p17, @p18, @p19)
 		ON CONFLICT (jid) DO UPDATE
 			SET lid=excluded.lid,
 				platform=excluded.platform,
 				business_name=excluded.business_name,
-				push_name=excluded.push_name
+				push_name=excluded.push_name,
+				lid_migration_ts=excluded.lid_migration_ts
 	`
 	mssqlInsertDeviceQuery = `
 		MERGE INTO whatsmeow_device AS target
-		USING (VALUES (@p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10, @p11, @p12, @p13, @p14, @p15, @p16, @p17, @p18)) AS source (jid, lid, registration_id, noise_key, identity_key, signed_pre_key, signed_pre_key_id, signed_pre_key_sig, adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig, platform, business_name, push_name, facebook_uuid, manager_id)
+		USING (VALUES (@p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10, @p11, @p12, @p13, @p14, @p15, @p16, @p17, @p18, @p19)) AS source (jid, lid, registration_id, noise_key, identity_key, signed_pre_key, signed_pre_key_id, signed_pre_key_sig, adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig, platform, business_name, push_name, facebook_uuid, lid_migration_ts, manager_id)
 		ON (target.jid = source.jid)
 		WHEN MATCHED THEN
 			UPDATE SET target.lid = source.lid, target.platform = source.platform, target.business_name = source.business_name, target.push_name = source.push_name
 		WHEN NOT MATCHED THEN
-			INSERT (jid, lid, registration_id, noise_key, identity_key, signed_pre_key, signed_pre_key_id, signed_pre_key_sig, adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig, platform, business_name, push_name, facebook_uuid, manager_id)
-			VALUES (source.jid, source.lid, source.registration_id, CONVERT(varbinary(max),source.noise_key), source.identity_key, source.signed_pre_key, source.signed_pre_key_id, source.signed_pre_key_sig, source.adv_key, source.adv_details, source.adv_account_sig, source.adv_account_sig_key, source.adv_device_sig, source.platform, source.business_name, source.push_name, source.facebook_uuid, source.manager_id);
+			INSERT (jid, lid, registration_id, noise_key, identity_key, signed_pre_key, signed_pre_key_id, signed_pre_key_sig, adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig, platform, business_name, push_name, facebook_uuid, lid_migration_ts, manager_id)
+			VALUES (source.jid, source.lid, source.registration_id, CONVERT(varbinary(max),source.noise_key), source.identity_key, source.signed_pre_key, source.signed_pre_key_id, source.signed_pre_key_sig, source.adv_key, source.adv_details, source.adv_account_sig, source.adv_account_sig_key, source.adv_device_sig, source.platform, source.business_name, source.push_name, source.facebook_uuid, source.lid_migration_ts, source.manager_id);
 	`
 	deleteDeviceQuery  = `DELETE FROM whatsmeow_device WHERE jid=@p1`
 	deleteMessageNodes = `DELETE FROM whatsapp_message_node WHERE our_jid=@p1`
@@ -441,13 +440,13 @@ func (c *Container) PutDevice(ctx context.Context, device *store.Device) error {
 			device.ID.String(), device.LID, device.RegistrationID, device.NoiseKey.Priv[:], device.IdentityKey.Priv[:],
 			device.SignedPreKey.Priv[:], device.SignedPreKey.KeyID, device.SignedPreKey.Signature[:],
 			device.AdvSecretKey, device.Account.Details, device.Account.AccountSignature, device.Account.AccountSignatureKey, device.Account.DeviceSignature,
-			device.Platform, device.BusinessName, device.PushName, device.FacebookUUID.String(), device.ManagerId)
+			device.Platform, device.BusinessName, device.PushName, device.FacebookUUID.String(), device.LIDMigrationTimestamp, device.ManagerId)
 	} else {
 		_, err = c.db.Exec(ctx, sqliteInsertDeviceQuery,
 			device.ID.String(), device.LID, device.RegistrationID, device.NoiseKey.Priv[:], device.IdentityKey.Priv[:],
 			device.SignedPreKey.Priv[:], device.SignedPreKey.KeyID, device.SignedPreKey.Signature[:],
 			device.AdvSecretKey, device.Account.Details, device.Account.AccountSignature, device.Account.AccountSignatureKey, device.Account.DeviceSignature,
-			device.Platform, device.BusinessName, device.PushName, uuid.NullUUID{UUID: device.FacebookUUID, Valid: device.FacebookUUID != uuid.Nil}, device.ManagerId)
+			device.Platform, device.BusinessName, device.PushName, uuid.NullUUID{UUID: device.FacebookUUID, Valid: device.FacebookUUID != uuid.Nil}, device.LIDMigrationTimestamp, device.ManagerId)
 	}
 	if !device.Initialized {
 		c.initializeDevice(device)

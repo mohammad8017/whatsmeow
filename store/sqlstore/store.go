@@ -1254,7 +1254,9 @@ const (
 
 func (s *SQLStore) PutMutedUntil(ctx context.Context, chat types.JID, mutedUntil time.Time) error {
 	var val int64
-	if !mutedUntil.IsZero() {
+	if mutedUntil == store.MutedForever {
+		val = -1
+	} else if !mutedUntil.IsZero() {
 		val = mutedUntil.Unix()
 	}
 	s.mutex.Lock()
@@ -1299,7 +1301,9 @@ func (s *SQLStore) GetChatSettings(ctx context.Context, chat types.JID) (setting
 	} else {
 		settings.Found = true
 	}
-	if mutedUntil != 0 {
+	if mutedUntil < 0 {
+		settings.MutedUntil = store.MutedForever
+	} else if mutedUntil > 0 {
 		settings.MutedUntil = time.Unix(mutedUntil, 0)
 	}
 	return
@@ -1324,10 +1328,26 @@ const (
 		);
 	`
 	sqliteGetMsgSecret = `
-		SELECT key FROM whatsmeow_message_secrets WHERE our_jid=@p1 AND chat_jid=@p2 AND sender_jid=@p3 AND message_id=@p4
+		SELECT key, sender_jid
+		FROM whatsmeow_message_secrets
+		WHERE our_jid=$1 AND chat_jid=$2 AND message_id=$4 AND (sender_jid=$3 OR sender_jid=(
+			CASE
+				WHEN $3 LIKE '%@lid'
+					THEN (SELECT pn || '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid=replace($3, '@lid', ''))
+				WHEN $3 LIKE '%@s.whatsapp.net'
+					THEN (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE lid=replace($3, '@s.whatsapp.net', ''))
+			END
+		))
 	`
 	mssqlGetMsgSecret = `
-		SELECT key_info FROM whatsmeow_message_secrets WITH (NOLOCK) WHERE our_jid=@p1 AND chat_jid=@p2 AND sender_jid=@p3 AND message_id=@p4
+		SELECT key_info FROM whatsmeow_message_secrets WITH (NOLOCK) WHERE our_jid=@p1 AND chat_jid=@p2 AND message_id=@p4 AND (sender_jid=@p3 OR sender_jid = 
+			CASE 
+        		WHEN @p3 LIKE '%@lid' 
+            		THEN (SELECT pn + '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid = REPLACE(@p3, '@lid', ''))
+        		WHEN @p3 LIKE '%@s.whatsapp.net' 
+            		THEN (SELECT lid + '@lid' FROM whatsmeow_lid_map WHERE lid = REPLACE(@p3, '@s.whatsapp.net', ''))
+    		END
+		)
 	`
 )
 
@@ -1389,11 +1409,11 @@ func (s *SQLStore) PutMessageSecret(ctx context.Context, chat, sender types.JID,
 	return nil
 }
 
-func (s *SQLStore) GetMessageSecret(ctx context.Context, chat, sender types.JID, id types.MessageID) (secret []byte, err error) {
+func (s *SQLStore) GetMessageSecret(ctx context.Context, chat, sender types.JID, id types.MessageID) (secret []byte, realSender types.JID, err error) {
 	if s.db.Dialect == dbutil.MSSQL {
-		err = s.db.QueryRow(ctx, mssqlGetMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id).Scan(&secret)
+		err = s.db.QueryRow(ctx, mssqlGetMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id).Scan(&secret, &realSender)
 	} else {
-		err = s.db.QueryRow(ctx, sqliteGetMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id).Scan(&secret)
+		err = s.db.QueryRow(ctx, sqliteGetMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id).Scan(&secret, &realSender)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil
