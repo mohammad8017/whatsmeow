@@ -13,7 +13,7 @@ import (
 )
 
 func (cli *Client) handleCallEvent(node *waBinary.Node) {
-	defer cli.maybeDeferredAck(node)()
+	defer cli.maybeDeferredAck(cli.BackgroundEventCtx, node)()
 
 	if len(node.GetChildren()) != 1 {
 		cli.dispatchEvent(&events.UnknownCallEvent{Node: node})
@@ -27,6 +27,13 @@ func (cli *Client) handleCallEvent(node *waBinary.Node) {
 		Timestamp:   ag.UnixTime("t"),
 		CallCreator: cag.JID("call-creator"),
 		CallID:      cag.String("call-id"),
+		GroupJID:    cag.OptionalJIDOrEmpty("group-jid"),
+	}
+	if basicMeta.CallCreator.Server == types.HiddenUserServer {
+		basicMeta.CallCreatorAlt = cag.OptionalJIDOrEmpty("caller_pn")
+	} else {
+		// This may not actually exist
+		basicMeta.CallCreatorAlt = cag.OptionalJIDOrEmpty("caller_lid")
 	}
 	switch child.Tag {
 	case "offer":

@@ -1,4 +1,4 @@
--- v0 -> v9 (compatible with v8+): Latest schema
+-- v0 -> v11 (compatible with v8+): Latest schema
 CREATE TABLE whatsmeow_device (
 	jid VARCHAR(300) PRIMARY KEY ,
 	lid VARCHAR(300),
@@ -17,7 +17,9 @@ CREATE TABLE whatsmeow_device (
 	platform      VARCHAR(300) NOT NULL DEFAULT '',
 	business_name VARCHAR(300) NOT NULL DEFAULT '',
 	push_name     VARCHAR(300) NOT NULL DEFAULT '',
-	manager_id     VARCHAR(300) NOT NULL DEFAULT ''
+	manager_id     VARCHAR(300) NOT NULL DEFAULT '',
+
+	lid_migration_ts BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE whatsmeow_identity_keys (
 	our_jid  VARCHAR(300),
@@ -89,6 +91,7 @@ CREATE TABLE whatsmeow_contacts (
 	full_name     VARCHAR(300),
 	push_name     VARCHAR(300),
 	business_name VARCHAR(300),
+	redacted_phone VARCHAR(300),
 	PRIMARY KEY (our_jid, their_jid),
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );

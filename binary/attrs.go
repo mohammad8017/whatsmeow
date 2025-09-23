@@ -75,7 +75,11 @@ func (au *AttrUtility) GetString(key string, require bool) (strVal string, ok bo
 			au.Errors = append(au.Errors, fmt.Errorf("didn't find required attribute '%s'", key))
 		}
 	} else if strVal, ok = val.(string); !ok {
-		au.Errors = append(au.Errors, fmt.Errorf("expected attribute '%s' to be string, but was %T", key, val))
+		if jidVal, ok := val.(types.JID); !ok {
+			au.Errors = append(au.Errors, fmt.Errorf("expected attribute '%s' to be string, but was %T", key, val))
+		} else {
+			strVal = jidVal.String()
+		}
 	}
 	return
 }

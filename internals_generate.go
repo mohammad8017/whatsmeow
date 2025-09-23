@@ -86,7 +86,7 @@ func getTypeName(expr ast.Expr) string {
 		// This isn't technically correct, but struct literals shouldn't be used for anything else
 		return "struct{}"
 	case *ast.Ellipsis:
-		return fmt.Sprintf("...%s", e.Elt)
+		return fmt.Sprintf("...%s", getTypeName(e.Elt))
 	case *ast.BasicLit:
 		return e.Value
 	default:
@@ -105,7 +105,7 @@ func main() {
 		"keepalive.go", "mediaconn.go", "mediaretry.go", "message.go", "msgsecret.go",
 		"newsletter.go", "notification.go", "pair-code.go", "pair.go", "prekeys.go",
 		"presence.go", "privacysettings.go", "push.go", "qrchan.go", "receipt.go", "request.go",
-		"retry.go", "sendfb.go", "send.go", "upload.go", "user.go",
+		"retry.go", "sendfb.go", "send.go", "upload.go", "user.go", "reportingtoken.go",
 	}
 	files := make([]*ast.File, len(fileNames))
 	for i, name := range fileNames {

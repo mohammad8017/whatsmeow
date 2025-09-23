@@ -157,8 +157,7 @@ func (cli *Client) handleRetryReceipt(ctx context.Context, receipt *events.Recei
 		signalSKDMessage, err := builder.Create(ctx, senderKeyName)
 		if err != nil {
 			cli.Log.Warnf("Failed to create sender key distribution message to include in retry of %s in %s to %s: %v", messageID, receipt.Chat, receipt.Sender, err)
-		}
-		if msg.wa != nil {
+		} else if msg.wa != nil {
 			msg.wa.SenderKeyDistributionMessage = &waE2E.SenderKeyDistributionMessage{
 				GroupID:                             proto.String(receipt.Chat.String()),
 				AxolotlSenderKeyDistributionMessage: signalSKDMessage.Serialize(),
@@ -334,7 +333,7 @@ func (cli *Client) delayedRequestMessageFromPhone(info *types.MessageInfo) {
 		cli.pendingPhoneRerequestsLock.Unlock()
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(cli.BackgroundEventCtx)
 	defer cancel()
 	cli.pendingPhoneRerequests[info.ID] = cancel
 	cli.pendingPhoneRerequestsLock.Unlock()
@@ -350,6 +349,10 @@ func (cli *Client) delayedRequestMessageFromPhone(info *types.MessageInfo) {
 		cli.Log.Debugf("Cancelled delayed request for message %s from phone", info.ID)
 		return
 	}
+	cli.immediateRequestMessageFromPhone(ctx, info)
+}
+
+func (cli *Client) immediateRequestMessageFromPhone(ctx context.Context, info *types.MessageInfo) {
 	_, err := cli.SendMessage(
 		ctx,
 		cli.getOwnID().ToNonAD(),
@@ -395,7 +398,11 @@ func (cli *Client) sendRetryReceipt(ctx context.Context, node *waBinary.Node, in
 		return
 	}
 	if retryCount == 1 {
-		go cli.delayedRequestMessageFromPhone(info)
+		if cli.SynchronousAck {
+			cli.immediateRequestMessageFromPhone(ctx, info)
+		} else {
+			go cli.delayedRequestMessageFromPhone(info)
+		}
 	}
 
 	var registrationIDBytes [4]byte

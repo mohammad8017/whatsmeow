@@ -14,12 +14,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	mssql "github.com/denisenkom/go-mssqldb"
 	"go.mau.fi/util/dbutil"
+	"go.mau.fi/util/exslices"
 	"go.mau.fi/util/exsync"
 	waBinary "go.mau.fi/whatsmeow/binary"
 
@@ -60,6 +62,11 @@ type contactUpdate struct {
 	contacts []store.ContactEntry
 }
 
+type contactRedactedPhoneUpdate struct {
+	sqlStore       *SQLStore
+	redactedPhones []store.RedactedPhoneEntry
+}
+
 type senderkeyUpdate struct {
 	sqlStore *SQLStore
 	group    string
@@ -67,11 +74,32 @@ type senderkeyUpdate struct {
 	session  []byte
 }
 
-type sessionUpdate struct {
+type sessionPut struct {
 	sqlStore *SQLStore
 	address  string
 	session  []byte
-	isAdd    bool
+}
+
+type sessionDelete struct {
+	sqlStore *SQLStore
+	address  string
+	session  []byte
+}
+
+type sessionMigratePnToLID struct {
+	sqlStore *SQLStore
+	pn, lid  types.JID
+}
+
+type sessionDeleteAll struct {
+	sqlStore *SQLStore
+	phone    string
+}
+
+type sessionBulkInsert struct {
+	sqlStore     *SQLStore
+	sessions     map[string][]byte
+	oldAddresses []string
 }
 
 type identityUpdate struct {
@@ -95,9 +123,9 @@ type putMessageSecretUpdate struct {
 }
 
 var sqlInstance *RetryDB
-var contactsChannel = make(chan contactUpdate, 1000)
+var contactsChannel = make(chan interface{}, 10000)
 var senderkeysChannel = make(chan senderkeyUpdate, 1000)
-var sessionChannel = make(chan sessionUpdate, 1000)
+var sessionChannel = make(chan interface{}, 10000)
 var identityChannel = make(chan identityUpdate, 1000)
 var removePreKeyChannel = make(chan removePreKeyUpdate, 1000)
 var putMessageSecretChannel = make(chan putMessageSecretUpdate, 1000)
@@ -130,19 +158,44 @@ func ManageContacts(ctx context.Context, logger waLog.Logger) {
 			}
 		}
 	}()
-	for contactUpdate := range contactsChannel {
-		err := bulkInsertContacts(ctx, contactUpdate)
+	for update := range contactsChannel {
+		var err error
+		messageType := ""
+		switch u := update.(type) {
+		case contactUpdate:
+			if u.sqlStore.db.Dialect == dbutil.MSSQL {
+				err = bulkInsertContacts(ctx, u)
+			} else {
+				err = massInsertContacts(ctx, u, logger)
+			}
+			messageType = "Update Contact"
+			u.sqlStore.contactCacheLock.Lock()
+			// Just clear the cache, fetching pushnames and business names would be too much effort
+			// I'll do it myself then F U XD
+			for _, updates := range u.contacts {
+				delete(u.sqlStore.contactCache, updates.JID)
+			}
+			u.sqlStore.contactCacheLock.Unlock()
+		case contactRedactedPhoneUpdate:
+			if u.sqlStore.db.Dialect == dbutil.MSSQL {
+				err = bulkInsertRedactedPhones(ctx, u)
+			} else {
+				err = massInsertRedactedPhones(ctx, u, logger)
+			}
+			messageType = "Update Contact"
+		}
 		if err != nil {
-			logger.Errorf("Could Not Insert Contacts: %s", err.Error())
+			logger.Errorf("Could Not Update Session %s: %s", messageType, err.Error())
 		}
-		contactUpdate.sqlStore.contactCacheLock.Lock()
-		// Just clear the cache, fetching pushnames and business names would be too much effort
-		// I'll do it myself then F U XD
-		for _, updates := range contactUpdate.contacts {
-			delete(contactUpdate.sqlStore.contactCache, updates.JID)
-		}
-		contactUpdate.sqlStore.contactCacheLock.Unlock()
 	}
+}
+
+func (s *SQLStore) PutAllContactNames(ctx context.Context, contacts []store.ContactEntry) error {
+	contactsChannel <- contactUpdate{
+		sqlStore: s,
+		contacts: contacts,
+	}
+	return nil
 }
 
 func bulkInsertContacts(ctx context.Context, update contactUpdate) error {
@@ -191,6 +244,117 @@ func bulkInsertContacts(ctx context.Context, update contactUpdate) error {
 	})
 }
 
+func massInsertContacts(ctx context.Context, update contactUpdate, logger waLog.Logger) error {
+	if len(update.contacts) == 0 {
+		return nil
+	}
+	origLen := len(update.contacts)
+	update.contacts = exslices.DeduplicateUnsortedOverwriteFunc(update.contacts, func(t store.ContactEntry) types.JID {
+		return t.JID
+	})
+	if origLen != len(update.contacts) {
+		logger.Warnf("%d duplicate contacts found in PutAllContactNames", origLen-len(update.contacts))
+	}
+	err := update.sqlStore.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for slice := range slices.Chunk(update.contacts, contactBatchSize) {
+			query, vars := sqlitePutContactNamesMassInsertBuilder.Build([1]any{update.sqlStore.JID}, slice)
+			_, err := update.sqlStore.db.Exec(ctx, query, vars...)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	update.sqlStore.contactCacheLock.Lock()
+	// Just clear the cache, fetching pushnames and business names would be too much effort
+	update.sqlStore.contactCache = make(map[types.JID]*types.ContactInfo)
+	update.sqlStore.contactCacheLock.Unlock()
+	return nil
+}
+
+func bulkInsertRedactedPhones(ctx context.Context, update contactRedactedPhoneUpdate) error {
+	return update.sqlStore.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		dt := time.Now()
+		_, err := update.sqlStore.db.Exec(ctx, fmt.Sprintf(`CREATE TABLE staging_contacts_%d (
+			our_jid       VARCHAR(300),
+			their_jid     VARCHAR(300),
+			redacted_phone    VARCHAR(300)
+		)`, dt.UnixMilli()))
+		if err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
+		}
+		bulkImportStr := mssql.CopyIn(fmt.Sprintf("staging_contacts_%d", dt.UnixMilli()), mssql.BulkOptions{}, "our_jid", "their_jid", "redacted_phone")
+		stmt, err := update.sqlStore.db.PrepareContext(ctx, bulkImportStr)
+		if err != nil {
+			return fmt.Errorf("failed to prepare bulk: %w", err)
+		}
+		for _, insert := range update.redactedPhones {
+			_, err = stmt.Exec(update.sqlStore.JID, insert.JID.String(), insert.RedactedPhone)
+			if err != nil {
+				return fmt.Errorf("failed to prepare insert: %w", err)
+			}
+		}
+		_, err = stmt.Exec()
+		if err != nil {
+			return fmt.Errorf("failed to execute bulk: %w", err)
+		}
+		_, err = update.sqlStore.db.Exec(ctx, fmt.Sprintf(`MERGE INTO whatsmeow_contacts AS target 
+		USING staging_contacts_%d AS source 
+		ON target.our_jid = source.our_jid AND target.their_jid = source.their_jid 
+		WHEN MATCHED THEN
+			UPDATE SET target.redacted_phone = source.redacted_phone
+		WHEN NOT MATCHED THEN
+			INSERT (our_jid, their_jid, redacted_phone)
+			VALUES (source.our_jid, source.their_jid, source.redacted_phone);`, dt.UnixMilli()))
+		if err != nil {
+			return fmt.Errorf("failed to merge bulk: %w", err)
+		}
+		_, err = update.sqlStore.db.Exec(ctx, fmt.Sprintf("DROP TABLE staging_contacts_%d", dt.UnixMilli()))
+		if err != nil {
+			return fmt.Errorf("failed to drop table: %w", err)
+		}
+		return nil
+	})
+}
+
+func massInsertRedactedPhones(ctx context.Context, update contactRedactedPhoneUpdate, logger waLog.Logger) error {
+	if len(update.redactedPhones) == 0 {
+		return nil
+	}
+	origLen := len(update.redactedPhones)
+	update.redactedPhones = exslices.DeduplicateUnsortedOverwriteFunc(update.redactedPhones, func(t store.RedactedPhoneEntry) types.JID {
+		return t.JID
+	})
+	if origLen != len(update.redactedPhones) {
+		logger.Warnf("%d duplicate contacts found in PutManyRedactedPhones", origLen-len(update.redactedPhones))
+	}
+	err := update.sqlStore.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for slice := range slices.Chunk(update.redactedPhones, contactBatchSize) {
+			query, vars := sqlitePutRedactedPhonesMassInsertBuilder.Build([1]any{update.sqlStore.JID}, slice)
+			_, err := update.sqlStore.db.Exec(ctx, query, vars...)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	update.sqlStore.contactCacheLock.Lock()
+	for _, entry := range update.redactedPhones {
+		if cached, ok := update.sqlStore.contactCache[entry.JID]; ok && cached.RedactedPhone == entry.RedactedPhone {
+			continue
+		}
+		delete(update.sqlStore.contactCache, entry.JID)
+	}
+	update.sqlStore.contactCacheLock.Unlock()
+	return nil
+}
+
 func ManageSenderKeys(ctx context.Context) {
 	for update := range senderkeysChannel {
 		err := manageSingleSenderKey(ctx, update)
@@ -214,18 +378,31 @@ func manageSingleSenderKey(ctx context.Context, senderkeyUpdate senderkeyUpdate)
 func ManageSessions(ctx context.Context, logger waLog.Logger) {
 	for update := range sessionChannel {
 		var err error
-		if update.isAdd {
-			err = putSingleSession(ctx, update)
-		} else {
-			err = deleteSingleSession(ctx, update)
+		messageType := ""
+		switch u := update.(type) {
+		case sessionPut:
+			err = putSingleSession(ctx, u)
+			messageType = "Put Session"
+		case sessionDelete:
+			err = deleteSingleSession(ctx, u)
+			messageType = "Delete Session"
+		case sessionMigratePnToLID:
+			err = migratePNToLIDSingleSession(ctx, u)
+			messageType = "Migrate PN to LID Session"
+		case sessionDeleteAll:
+			err = u.sqlStore.deleteAllSessions(ctx, u.phone)
+			messageType = "Delete All Sessions"
+		case sessionBulkInsert:
+			err = storeSessionsFromChan(ctx, u)
+			messageType = "Bulk Insert Sessions"
 		}
 		if err != nil {
-			logger.Errorf("Could Not Update Session %s: %s", update.address, err.Error())
+			logger.Errorf("Could Not Update Session %s: %s", messageType, err.Error())
 		}
 	}
 }
 
-func putSingleSession(ctx context.Context, update sessionUpdate) (err error) {
+func putSingleSession(ctx context.Context, update sessionPut) (err error) {
 	update.sqlStore.mutex.Lock()
 	defer update.sqlStore.mutex.Unlock()
 	if update.sqlStore.db.Dialect == dbutil.MSSQL {
@@ -236,11 +413,152 @@ func putSingleSession(ctx context.Context, update sessionUpdate) (err error) {
 	return err
 }
 
-func deleteSingleSession(ctx context.Context, update sessionUpdate) (err error) {
+func deleteSingleSession(ctx context.Context, update sessionDelete) (err error) {
 	update.sqlStore.mutex.Lock()
 	defer update.sqlStore.mutex.Unlock()
 	_, err = update.sqlStore.db.Exec(ctx, deleteSessionQuery, update.sqlStore.JID, update.address)
 	return err
+}
+
+func migratePNToLIDSingleSession(ctx context.Context, update sessionMigratePnToLID) (err error) {
+	pnSignal := update.pn.SignalAddressUser()
+	if !update.sqlStore.migratedPNSessionsCache.Add(pnSignal) {
+		return nil
+	}
+	var sessionsUpdated, identityKeysUpdated, senderKeysUpdated int64
+	lidSignal := update.lid.SignalAddressUser()
+	err = update.sqlStore.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		var res sql.Result
+		var err error
+		if update.sqlStore.db.Dialect == dbutil.MSSQL {
+			res, err = update.sqlStore.db.Exec(ctx, mssqlMigratePNToLIDSessionsQuery, update.sqlStore.JID, pnSignal, lidSignal)
+		} else {
+			res, err = update.sqlStore.db.Exec(ctx, sqliteMigratePNToLIDSessionsQuery, update.sqlStore.JID, pnSignal, lidSignal)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to migrate sessions: %w", err)
+		}
+		sessionsUpdated, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected for sessions: %w", err)
+		}
+		err = update.sqlStore.deleteAllSessions(ctx, pnSignal)
+		if err != nil {
+			return fmt.Errorf("failed to delete extra sessions: %w", err)
+		}
+		if update.sqlStore.db.Dialect == dbutil.MSSQL {
+			res, err = update.sqlStore.db.Exec(ctx, mssqlMigratePNToLIDSenderKeysQuery, update.sqlStore.JID, pnSignal, lidSignal)
+		} else {
+			res, err = update.sqlStore.db.Exec(ctx, sqliteMigratePNToLIDSenderKeysQuery, update.sqlStore.JID, pnSignal, lidSignal)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to migrate sender keys: %w", err)
+		}
+		senderKeysUpdated, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected for sender keys: %w", err)
+		}
+		err = update.sqlStore.deleteAllSenderKeys(ctx, pnSignal)
+		if err != nil {
+			return fmt.Errorf("failed to delete extra sender keys: %w", err)
+		}
+		if update.sqlStore.db.Dialect == dbutil.MSSQL {
+			res, err = update.sqlStore.db.Exec(ctx, mssqlMigratePNToLIDIdentityKeysQuery, update.sqlStore.JID, pnSignal, lidSignal)
+			if err != nil {
+				return fmt.Errorf("failed to migrate identity keys: %w", err)
+			}
+		} else {
+			res, err = update.sqlStore.db.Exec(ctx, sqliteMigratePNToLIDIdentityKeysQuery, update.sqlStore.JID, pnSignal, lidSignal)
+			if err != nil {
+				return fmt.Errorf("failed to migrate identity keys: %w", err)
+			}
+		}
+
+		identityKeysUpdated, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected for identity keys: %w", err)
+		}
+		err = update.sqlStore.deleteAllIdentityKeys(ctx, pnSignal)
+		if err != nil {
+			return fmt.Errorf("failed to delete extra identity keys: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if sessionsUpdated > 0 || senderKeysUpdated > 0 || identityKeysUpdated > 0 {
+		update.sqlStore.log.Infof("Migrated %d sessions, %d identity keys and %d sender keys from %s to %s", sessionsUpdated, identityKeysUpdated, senderKeysUpdated, pnSignal, lidSignal)
+	} else {
+		update.sqlStore.log.Debugf("No sessions or sender keys found to migrate from %s to %s", pnSignal, lidSignal)
+	}
+	return nil
+}
+
+func storeSessionsFromChan(ctx context.Context, update sessionBulkInsert) error {
+	update.sqlStore.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		if len(update.oldAddresses) > 0 {
+			query := removeSessionsQuery + "("
+			queryParams := make([]interface{}, len(update.oldAddresses)+1)
+			queryParams[0] = update.sqlStore.JID
+			for index, address := range update.oldAddresses {
+				if index > 0 {
+					query += ","
+				}
+				query += fmt.Sprintf("@p%d", index+2)
+				queryParams[index+1] = address
+			}
+			query += ")"
+			_, err := update.sqlStore.db.Exec(ctx, query, queryParams...)
+			if err != nil {
+				update.sqlStore.log.Errorf("Could not Remove Sessions: " + err.Error())
+				return err
+			}
+		}
+		dt := time.Now()
+		_, err := update.sqlStore.db.Exec(ctx, fmt.Sprintf(`CREATE TABLE staging_sessions_%d (
+			our_jid   VARCHAR(300),
+			their_id  VARCHAR(300),
+			session  VARBINARY(max),
+		)`, dt.UnixMilli()))
+		if err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
+		}
+		bulkImportStr := mssql.CopyIn(fmt.Sprintf("staging_sessions_%d", dt.UnixMilli()), mssql.BulkOptions{}, "our_jid", "their_id", "session")
+		stmt, err := update.sqlStore.db.PrepareContext(ctx, bulkImportStr)
+		if err != nil {
+			update.sqlStore.log.Errorf("Could not Prepare Statement: " + err.Error())
+			return err
+		}
+		for address, session := range update.sessions {
+			stmt.Exec(update.sqlStore.JID, address, session[:])
+		}
+		_, err = stmt.Exec()
+		if err != nil {
+			update.sqlStore.log.Errorf("Could not Store Sessions: " + err.Error())
+			return err
+		}
+		_, err = update.sqlStore.db.Exec(ctx, fmt.Sprintf(`MERGE INTO whatsmeow_sessions AS target 
+			USING staging_sessions_%d AS source 
+			ON target.our_jid = source.our_jid AND target.their_id = source.their_id
+			WHEN MATCHED THEN
+				UPDATE SET target.session = source.session 
+			WHEN NOT MATCHED THEN 
+				INSERT (our_jid, their_id, session) 
+				VALUES (source.our_jid, source.their_id, source.session);`, dt.UnixMilli()))
+		if err != nil {
+			update.sqlStore.log.Errorf("failed to merge bulk: " + err.Error())
+			return fmt.Errorf("failed to merge bulk: %w", err)
+		}
+		_, err = update.sqlStore.db.Exec(ctx, fmt.Sprintf("DROP TABLE staging_sessions_%d", dt.UnixMilli()))
+		if err != nil {
+			update.sqlStore.log.Errorf("failed to drop table: " + err.Error())
+			return fmt.Errorf("failed to drop table: %w", err)
+		}
+		return nil
+	})
+	return nil
 }
 
 func ManageIdentities(ctx context.Context, logger waLog.Logger) {
@@ -486,17 +804,20 @@ func (s *SQLStore) HasSession(ctx context.Context, address string) (has bool, er
 }
 
 func (s *SQLStore) PutSession(ctx context.Context, address string, session []byte) error {
-	sessionChannel <- sessionUpdate{
+	sessionChannel <- sessionPut{
 		sqlStore: s,
 		address:  address,
 		session:  session,
-		isAdd:    true,
 	}
 	return nil
 }
 
 func (s *SQLStore) DeleteAllSessions(ctx context.Context, phone string) error {
-	return s.deleteAllSessions(ctx, phone)
+	sessionChannel <- sessionDeleteAll{
+		sqlStore: s,
+		phone:    phone,
+	}
+	return nil
 }
 
 func (s *SQLStore) deleteAllSessions(ctx context.Context, phone string) error {
@@ -523,86 +844,18 @@ func (s *SQLStore) deleteAllIdentityKeys(ctx context.Context, phone string) erro
 }
 
 func (s *SQLStore) DeleteSession(ctx context.Context, address string) error {
-	sessionChannel <- sessionUpdate{
+	sessionChannel <- sessionDelete{
 		sqlStore: s,
 		address:  address,
-		isAdd:    false,
 	}
 	return nil
 }
 
 func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
-	pnSignal := pn.SignalAddressUser()
-	if !s.migratedPNSessionsCache.Add(pnSignal) {
-		return nil
-	}
-	var sessionsUpdated, identityKeysUpdated, senderKeysUpdated int64
-	lidSignal := lid.SignalAddressUser()
-	err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		var res sql.Result
-		var err error
-		if s.db.Dialect == dbutil.MSSQL {
-			res, err = s.db.Exec(ctx, mssqlMigratePNToLIDSessionsQuery, s.JID, pnSignal, lidSignal)
-		} else {
-			res, err = s.db.Exec(ctx, sqliteMigratePNToLIDSessionsQuery, s.JID, pnSignal, lidSignal)
-		}
-		if err != nil {
-			return fmt.Errorf("failed to migrate sessions: %w", err)
-		}
-		sessionsUpdated, err = res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("failed to get rows affected for sessions: %w", err)
-		}
-		err = s.deleteAllSessions(ctx, pnSignal)
-		if err != nil {
-			return fmt.Errorf("failed to delete extra sessions: %w", err)
-		}
-		if s.db.Dialect == dbutil.MSSQL {
-			res, err = s.db.Exec(ctx, mssqlMigratePNToLIDSenderKeysQuery, s.JID, pnSignal, lidSignal)
-		} else {
-			res, err = s.db.Exec(ctx, sqliteMigratePNToLIDSenderKeysQuery, s.JID, pnSignal, lidSignal)
-		}
-		if err != nil {
-			return fmt.Errorf("failed to migrate sender keys: %w", err)
-		}
-		senderKeysUpdated, err = res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("failed to get rows affected for sender keys: %w", err)
-		}
-		err = s.deleteAllSenderKeys(ctx, pnSignal)
-		if err != nil {
-			return fmt.Errorf("failed to delete extra sender keys: %w", err)
-		}
-		if s.db.Dialect == dbutil.MSSQL {
-			res, err = s.db.Exec(ctx, mssqlMigratePNToLIDIdentityKeysQuery, s.JID, pnSignal, lidSignal)
-			if err != nil {
-				return fmt.Errorf("failed to migrate identity keys: %w", err)
-			}
-		} else {
-			res, err = s.db.Exec(ctx, sqliteMigratePNToLIDIdentityKeysQuery, s.JID, pnSignal, lidSignal)
-			if err != nil {
-				return fmt.Errorf("failed to migrate identity keys: %w", err)
-			}
-		}
-
-		identityKeysUpdated, err = res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("failed to get rows affected for identity keys: %w", err)
-		}
-		err = s.deleteAllIdentityKeys(ctx, pnSignal)
-		if err != nil {
-			return fmt.Errorf("failed to delete extra identity keys: %w", err)
-		}
-
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if sessionsUpdated > 0 || senderKeysUpdated > 0 || identityKeysUpdated > 0 {
-		s.log.Infof("Migrated %d sessions, %d identity keys and %d sender keys from %s to %s", sessionsUpdated, identityKeysUpdated, senderKeysUpdated, pnSignal, lidSignal)
-	} else {
-		s.log.Debugf("No sessions or sender keys found to migrate from %s to %s", pnSignal, lidSignal)
+	sessionChannel <- sessionMigratePnToLID{
+		sqlStore: s,
+		pn:       pn,
+		lid:      lid,
 	}
 	return nil
 }
@@ -989,7 +1242,7 @@ func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, inde
 
 const (
 	sqlitePutContactNameQuery = `
-		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name) VALUES (@p1, @p2, @p3, @p4)
+		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name) VALUES ($1, $2, $3, $4)
 		ON CONFLICT (our_jid, their_jid) DO UPDATE SET first_name=excluded.first_name, full_name=excluded.full_name
 	`
 	mssqlPutContactNameQuery = `
@@ -1006,6 +1259,21 @@ const (
 		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name)
 		VALUES %s
 		ON CONFLICT (our_jid, their_jid) DO UPDATE SET first_name=excluded.first_name, full_name=excluded.full_name
+	`
+	sqlitePutRedactedPhoneQuery = `
+		INSERT INTO whatsmeow_contacts (our_jid, their_jid, redacted_phone)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (our_jid, their_jid) DO UPDATE SET redacted_phone=excluded.redacted_phone
+	`
+	mssqlPutRedactedPhoneQuery = `
+		MERGE INTO whatsmeow_contacts AS target
+		USING (VALUES (@p1, @p2, @p3)) AS source (our_jid, their_jid, redacted_phone)
+		ON (target.our_jid = source.our_jid AND target.their_jid = source.their_jid)
+		WHEN MATCHED THEN
+			UPDATE SET target.redacted_phone = source.redacted_phone
+		WHEN NOT MATCHED THEN
+			INSERT (our_jid, their_jid, redacted_phone)
+			VALUES (source.our_jid, source.their_jid, source.redacted_phone);
 	`
 	mssqlPutManyContactNamesQuery = `
 		MERGE INTO whatsmeow_contacts AS target
@@ -1046,11 +1314,19 @@ const (
 			VALUES (source.our_jid, source.their_jid, source.business_name);
 	`
 	getContactQuery = `
-		SELECT first_name, full_name, push_name, business_name FROM whatsmeow_contacts WITH (NOLOCK) WHERE our_jid=@p1 AND their_jid=@p2
+		SELECT first_name, full_name, push_name, business_name, redacted_phone FROM whatsmeow_contacts WITH (NOLOCK) WHERE our_jid=@p1 AND their_jid=@p2
 	`
 	getAllContactsQuery = `
-		SELECT their_jid, first_name, full_name, push_name, business_name FROM whatsmeow_contacts WITH (NOLOCK) WHERE our_jid=@p1
+		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone FROM whatsmeow_contacts WITH (NOLOCK) WHERE our_jid=@p1
 	`
+)
+
+var sqlitePutContactNamesMassInsertBuilder = dbutil.NewMassInsertBuilder[store.ContactEntry, [1]any](
+	sqlitePutContactNameQuery, "($1, $%d, $%d, $%d)",
+)
+
+var sqlitePutRedactedPhonesMassInsertBuilder = dbutil.NewMassInsertBuilder[store.RedactedPhoneEntry, [1]any](
+	sqlitePutRedactedPhoneQuery, "($1, $%d, $%d)",
 )
 
 func (s *SQLStore) PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error) {
@@ -1129,45 +1405,10 @@ func (s *SQLStore) PutContactName(ctx context.Context, user types.JID, firstName
 
 const contactBatchSize = 300
 
-func (s *SQLStore) putContactNamesBatch(ctx context.Context, contacts []store.ContactEntry) error {
-	values := make([]any, 1, 1+len(contacts)*3)
-	queryParts := make([]string, 0, len(contacts))
-	values[0] = s.JID
-	placeholderSyntax := "(@p1, @p%d, @p%d, @p%d)"
-	if s.db.Dialect == dbutil.SQLite {
-		placeholderSyntax = "(?1, ?%d, ?%d, ?%d)"
-	}
-	i := 0
-	handledContacts := make(map[types.JID]struct{}, len(contacts))
-	for _, contact := range contacts {
-		if contact.JID.IsEmpty() {
-			s.log.Warnf("Empty contact info in mass insert: %+v", contact)
-			continue
-		}
-		// The whole query will break if there are duplicates, so make sure there aren't any duplicates
-		_, alreadyHandled := handledContacts[contact.JID]
-		if alreadyHandled {
-			s.log.Warnf("Duplicate contact info for %s in mass insert", contact.JID)
-			continue
-		}
-		handledContacts[contact.JID] = struct{}{}
-		baseIndex := i*3 + 1
-		values = append(values, contact.JID.String(), contact.FirstName, contact.FullName)
-		queryParts = append(queryParts, fmt.Sprintf(placeholderSyntax, baseIndex+1, baseIndex+2, baseIndex+3))
-		i++
-	}
-	if s.db.Dialect == dbutil.MSSQL {
-		_, err := s.db.Exec(ctx, fmt.Sprintf(mssqlPutManyContactNamesQuery, strings.Join(queryParts, ",")), values...)
-		return err
-	}
-	_, err := s.db.Exec(ctx, fmt.Sprintf(sqlitePutManyContactNamesQuery, strings.Join(queryParts, ",")), values...)
-	return err
-}
-
-func (s *SQLStore) PutAllContactNames(ctx context.Context, contacts []store.ContactEntry) error {
-	contactsChannel <- contactUpdate{
-		sqlStore: s,
-		contacts: contacts,
+func (s *SQLStore) PutManyRedactedPhones(ctx context.Context, entries []store.RedactedPhoneEntry) error {
+	contactsChannel <- contactRedactedPhoneUpdate{
+		sqlStore:       s,
+		redactedPhones: entries,
 	}
 	return nil
 }
@@ -1178,17 +1419,18 @@ func (s *SQLStore) getContact(ctx context.Context, user types.JID) (*types.Conta
 		return cached, nil
 	}
 
-	var first, full, push, business sql.NullString
-	err := s.db.QueryRow(ctx, getContactQuery, s.JID, user).Scan(&first, &full, &push, &business)
+	var first, full, push, business, redactedPhone sql.NullString
+	err := s.db.QueryRow(ctx, getContactQuery, s.JID, user).Scan(&first, &full, &push, &business, &redactedPhone)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 	info := &types.ContactInfo{
-		Found:        err == nil,
-		FirstName:    first.String,
-		FullName:     full.String,
-		PushName:     push.String,
-		BusinessName: business.String,
+		Found:         err == nil,
+		FirstName:     first.String,
+		FullName:      full.String,
+		PushName:      push.String,
+		BusinessName:  business.String,
+		RedactedPhone: redactedPhone.String,
 	}
 	s.contactCache[user] = info
 	return info, nil
@@ -1214,17 +1456,18 @@ func (s *SQLStore) GetAllContacts(ctx context.Context) (map[types.JID]types.Cont
 	output := make(map[types.JID]types.ContactInfo, len(s.contactCache))
 	for rows.Next() {
 		var jid types.JID
-		var first, full, push, business sql.NullString
-		err = rows.Scan(&jid, &first, &full, &push, &business)
+		var first, full, push, business, redactedPhone sql.NullString
+		err = rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone)
 		if err != nil {
 			return nil, fmt.Errorf("error scanning row: %w", err)
 		}
 		info := types.ContactInfo{
-			Found:        true,
-			FirstName:    first.String,
-			FullName:     full.String,
-			PushName:     push.String,
-			BusinessName: business.String,
+			Found:         true,
+			FirstName:     first.String,
+			FullName:      full.String,
+			PushName:      push.String,
+			BusinessName:  business.String,
+			RedactedPhone: redactedPhone.String,
 		}
 		output[jid] = info
 		s.contactCache[jid] = &info
@@ -1254,7 +1497,9 @@ const (
 
 func (s *SQLStore) PutMutedUntil(ctx context.Context, chat types.JID, mutedUntil time.Time) error {
 	var val int64
-	if !mutedUntil.IsZero() {
+	if mutedUntil == store.MutedForever {
+		val = -1
+	} else if !mutedUntil.IsZero() {
 		val = mutedUntil.Unix()
 	}
 	s.mutex.Lock()
@@ -1299,7 +1544,9 @@ func (s *SQLStore) GetChatSettings(ctx context.Context, chat types.JID) (setting
 	} else {
 		settings.Found = true
 	}
-	if mutedUntil != 0 {
+	if mutedUntil < 0 {
+		settings.MutedUntil = store.MutedForever
+	} else if mutedUntil > 0 {
 		settings.MutedUntil = time.Unix(mutedUntil, 0)
 	}
 	return
@@ -1324,7 +1571,23 @@ const (
 		);
 	`
 	sqliteGetMsgSecret = `
-		SELECT key FROM whatsmeow_message_secrets WHERE our_jid=@p1 AND chat_jid=@p2 AND sender_jid=@p3 AND message_id=@p4
+		SELECT key, sender_jid
+		FROM whatsmeow_message_secrets
+		WHERE our_jid=$1 AND (chat_jid=$2 OR chat_jid=(
+			CASE
+				WHEN $2 LIKE '%@lid'
+					THEN (SELECT pn || '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid=replace($2, '@lid', ''))
+				WHEN $2 LIKE '%@s.whatsapp.net'
+					THEN (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE lid=replace($2, '@s.whatsapp.net', ''))
+			END
+		)) AND message_id=$4 AND (sender_jid=$3 OR sender_jid=(
+			CASE
+				WHEN $3 LIKE '%@lid'
+					THEN (SELECT pn || '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid=replace($3, '@lid', ''))
+				WHEN $3 LIKE '%@s.whatsapp.net'
+					THEN (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE lid=replace($3, '@s.whatsapp.net', ''))
+			END
+		))
 	`
 	mssqlGetMsgSecret = `
 		SELECT key_info FROM whatsmeow_message_secrets WITH (NOLOCK) WHERE our_jid=@p1 AND chat_jid=@p2 AND sender_jid=@p3 AND message_id=@p4
@@ -1389,11 +1652,11 @@ func (s *SQLStore) PutMessageSecret(ctx context.Context, chat, sender types.JID,
 	return nil
 }
 
-func (s *SQLStore) GetMessageSecret(ctx context.Context, chat, sender types.JID, id types.MessageID) (secret []byte, err error) {
+func (s *SQLStore) GetMessageSecret(ctx context.Context, chat, sender types.JID, id types.MessageID) (secret []byte, realSender types.JID, err error) {
 	if s.db.Dialect == dbutil.MSSQL {
-		err = s.db.QueryRow(ctx, mssqlGetMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id).Scan(&secret)
+		err = s.db.QueryRow(ctx, mssqlGetMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id).Scan(&secret, &realSender)
 	} else {
-		err = s.db.QueryRow(ctx, sqliteGetMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id).Scan(&secret)
+		err = s.db.QueryRow(ctx, sqliteGetMsgSecret, s.JID, chat.ToNonAD(), sender.ToNonAD(), id).Scan(&secret, &realSender)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil
@@ -1564,67 +1827,11 @@ func (s *SQLStore) CacheIdentities(ctx context.Context, addresses []string) (fin
 }
 
 func (s *SQLStore) StoreSessions(ctx context.Context, sessions map[string][]byte, oldAddresses []string) {
-	s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		if len(oldAddresses) > 0 {
-			query := removeSessionsQuery + "("
-			queryParams := make([]interface{}, len(oldAddresses)+1)
-			queryParams[0] = s.JID
-			for index, address := range oldAddresses {
-				if index > 0 {
-					query += ","
-				}
-				query += fmt.Sprintf("@p%d", index+2)
-				queryParams[index+1] = address
-			}
-			query += ")"
-			_, err := s.db.Exec(ctx, query, queryParams...)
-			if err != nil {
-				s.log.Errorf("Could not Remove Sessions: " + err.Error())
-				return err
-			}
-		}
-		dt := time.Now()
-		_, err := s.db.Exec(ctx, fmt.Sprintf(`CREATE TABLE staging_sessions_%d (
-			our_jid   VARCHAR(300),
-			their_id  VARCHAR(300),
-			session  VARBINARY(max),
-		)`, dt.UnixMilli()))
-		if err != nil {
-			return fmt.Errorf("failed to create table: %w", err)
-		}
-		bulkImportStr := mssql.CopyIn(fmt.Sprintf("staging_sessions_%d", dt.UnixMilli()), mssql.BulkOptions{}, "our_jid", "their_id", "session")
-		stmt, err := s.db.PrepareContext(ctx, bulkImportStr)
-		if err != nil {
-			s.log.Errorf("Could not Prepare Statement: " + err.Error())
-			return err
-		}
-		for address, session := range sessions {
-			stmt.Exec(s.JID, address, session[:])
-		}
-		_, err = stmt.Exec()
-		if err != nil {
-			s.log.Errorf("Could not Store Sessions: " + err.Error())
-			return err
-		}
-		_, err = s.db.Exec(ctx, fmt.Sprintf(`MERGE INTO whatsmeow_sessions AS target 
-			USING staging_sessions_%d AS source 
-			ON target.our_jid = source.our_jid AND target.their_id = source.their_id
-			WHEN MATCHED THEN
-				UPDATE SET target.session = source.session 
-			WHEN NOT MATCHED THEN 
-				INSERT (our_jid, their_id, session) 
-				VALUES (source.our_jid, source.their_id, source.session);`, dt.UnixMilli()))
-		if err != nil {
-			s.log.Errorf("failed to merge bulk: " + err.Error())
-			return fmt.Errorf("failed to merge bulk: %w", err)
-		}
-		_, err = s.db.Exec(ctx, fmt.Sprintf("DROP TABLE staging_sessions_%d", dt.UnixMilli()))
-		if err != nil {
-			s.log.Errorf("failed to drop table: " + err.Error())
-			return fmt.Errorf("failed to drop table: %w", err)
-		}
-		return nil
-	})
+	sessionChannel <- sessionBulkInsert{
+		sqlStore:     s,
+		sessions:     sessions,
+		oldAddresses: oldAddresses,
+	}
 }
 
 func (s *SQLStore) StoreIdentities(ctx context.Context, identityKeys map[string][32]byte, oldAddresses []string) {
@@ -1753,7 +1960,7 @@ func (s *SQLStore) DeleteMessageNode(ctx context.Context, ref int) (err error) {
 	return err
 }
 func (s *SQLStore) DeleteOldMessageNodes(ctx context.Context) (err error) {
-	_, err = s.db.Exec(ctx, removeOldMessageNodeQuery, time.Now().Add(-14*24*time.Hour).UnixMilli())
+	_, err = s.db.Exec(ctx, removeOldMessageNodeQuery, time.Now().Add(-4*24*time.Hour).UnixMilli())
 	return err
 }
 

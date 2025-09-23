@@ -14,6 +14,7 @@ import (
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	armadillo "go.mau.fi/whatsmeow/proto"
+	"go.mau.fi/whatsmeow/proto/instamadilloTransportPayload"
 	"go.mau.fi/whatsmeow/proto/waArmadilloApplication"
 	"go.mau.fi/whatsmeow/proto/waConsumerApplication"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -299,6 +300,7 @@ type Message struct {
 	IsViewOnceV2Extension bool // True if the message was unwrapped from a ViewOnceMessageV2Extension
 	IsDocumentWithCaption bool // True if the message was unwrapped from a DocumentWithCaptionMessage
 	IsLottieSticker       bool // True if the message was unwrapped from a LottieStickerMessage
+	IsBotInvoke           bool // True if the message was unwrapped from a BotInvokeMessage
 	IsEdit                bool // True if the message was unwrapped from an EditedMessage
 
 	// If this event was parsed from a WebMessageInfo (i.e. from a history sync or unavailable message request), the source data is here.
@@ -322,8 +324,10 @@ type FBMessage struct {
 	// If the message was re-requested from the sender, this is the number of retries it took.
 	RetryCount int
 
-	Transport   *waMsgTransport.MessageTransport     // The first level of wrapping the message was in
-	Application *waMsgApplication.MessageApplication // The second level of wrapping the message was in
+	Transport *waMsgTransport.MessageTransport // The first level of wrapping the message was in
+
+	FBApplication *waMsgApplication.MessageApplication           // The second level of wrapping the message was in, for FB messages
+	IGTransport   *instamadilloTransportPayload.TransportPayload // The second level of wrapping the message was in, for IG messages
 }
 
 func (evt *FBMessage) GetConsumerApplication() *waConsumerApplication.ConsumerApplication {
@@ -349,6 +353,10 @@ func (evt *Message) UnwrapRaw() *Message {
 			Phash:          evt.Message.GetDeviceSentMessage().GetPhash(),
 		}
 		evt.Message = evt.Message.GetDeviceSentMessage().GetMessage()
+	}
+	if evt.Message.GetBotInvokeMessage().GetMessage() != nil {
+		evt.Message = evt.Message.GetBotInvokeMessage().GetMessage()
+		evt.IsBotInvoke = true
 	}
 	if evt.Message.GetEphemeralMessage().GetMessage() != nil {
 		evt.Message = evt.Message.GetEphemeralMessage().GetMessage()
@@ -380,6 +388,9 @@ func (evt *Message) UnwrapRaw() *Message {
 	if evt.Message.GetEditedMessage().GetMessage() != nil {
 		evt.Message = evt.Message.GetEditedMessage().GetMessage()
 		evt.IsEdit = true
+	}
+	if evt.Message != nil && evt.RawMessage != nil && evt.Message.MessageContextInfo == nil && evt.RawMessage.MessageContextInfo != nil {
+		evt.Message.MessageContextInfo = evt.RawMessage.MessageContextInfo
 	}
 	return evt
 }
