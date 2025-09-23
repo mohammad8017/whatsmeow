@@ -18,7 +18,6 @@ CREATE TABLE whatsmeow_device (
 	business_name VARCHAR(300) NOT NULL DEFAULT '',
 	push_name     VARCHAR(300) NOT NULL DEFAULT '',
 	manager_id     VARCHAR(300) NOT NULL DEFAULT '',
-
 	lid_migration_ts BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE whatsmeow_identity_keys (
