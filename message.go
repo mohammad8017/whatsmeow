@@ -40,31 +40,30 @@ import (
 
 var pbSerializer = store.SignalProtobufSerializer
 
-func (cli *Client) handleEncryptedMessage(node *waBinary.Node) {
-    ctx := cli.BackgroundEventCtx
-    info, err := cli.parseMessageInfo(node)
-    if err != nil {
-        cli.Log.Warnf("Failed to parse message: %v", err)
-    } else {
-        if !info.SenderAlt.IsEmpty() {
-            cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
-        } else if !info.RecipientAlt.IsEmpty() {
-            cli.StoreLIDPNMapping(ctx, info.RecipientAlt, info.Chat)
-        }
-        if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
-            go cli.updateBusinessName(cli.BackgroundEventCtx, info.Sender, info, info.VerifiedName.Details.GetVerifiedName())
-        }
-        if len(info.PushName) > 0 && info.PushName != "-" && (cli.MessengerConfig == nil || info.PushName != "username") {
-            go cli.updatePushName(cli.BackgroundEventCtx, info.Sender, info, info.PushName)
-        }
-        var cancelled bool
-        defer cli.maybeDeferredAck(ctx, node)(&cancelled)
-        if info.Sender.Server == types.NewsletterServer {
-            cancelled = cli.handlePlaintextMessage(ctx, info, node)
-        } else {
-            cancelled = cli.decryptMessages(ctx, info, node)
-        }
-    }
+func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.Node) {
+	info, err := cli.parseMessageInfo(node)
+	if err != nil {
+		cli.Log.Warnf("Failed to parse message: %v", err)
+	} else {
+		if !info.SenderAlt.IsEmpty() {
+			cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
+		} else if !info.RecipientAlt.IsEmpty() {
+			cli.StoreLIDPNMapping(ctx, info.RecipientAlt, info.Chat)
+		}
+		if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
+			go cli.updateBusinessName(ctx, info.Sender, info.SenderAlt, info, info.VerifiedName.Details.GetVerifiedName())
+		}
+		if len(info.PushName) > 0 && info.PushName != "-" && (cli.MessengerConfig == nil || info.PushName != "username") {
+			go cli.updatePushName(ctx, info.Sender, info.SenderAlt, info, info.PushName)
+		}
+		if info.Sender.Server == types.NewsletterServer {
+			var cancelled bool
+			defer cli.maybeDeferredAck(ctx, node)(&cancelled)
+			cancelled = cli.handlePlaintextMessage(ctx, info, node)
+		} else {
+			cli.decryptMessages(ctx, info, node)
+		}
+	}
 }
 
 func (cli *Client) ManualHandleEncryptedMessage(ctx context.Context, node *waBinary.Node) {
