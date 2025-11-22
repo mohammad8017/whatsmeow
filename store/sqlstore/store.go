@@ -97,9 +97,8 @@ type sessionDeleteAll struct {
 }
 
 type sessionBulkInsert struct {
-	sqlStore     *SQLStore
-	sessions     map[string][]byte
-	oldAddresses []string
+	sqlStore *SQLStore
+	sessions map[string][]byte
 }
 
 type identityUpdate struct {
@@ -498,24 +497,6 @@ func migratePNToLIDSingleSession(ctx context.Context, update sessionMigratePnToL
 
 func storeSessionsFromChan(ctx context.Context, update sessionBulkInsert) error {
 	update.sqlStore.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		if len(update.oldAddresses) > 0 {
-			query := removeSessionsQuery + "("
-			queryParams := make([]interface{}, len(update.oldAddresses)+1)
-			queryParams[0] = update.sqlStore.JID
-			for index, address := range update.oldAddresses {
-				if index > 0 {
-					query += ","
-				}
-				query += fmt.Sprintf("@p%d", index+2)
-				queryParams[index+1] = address
-			}
-			query += ")"
-			_, err := update.sqlStore.db.Exec(ctx, query, queryParams...)
-			if err != nil {
-				update.sqlStore.log.Errorf("Could not Remove Sessions: " + err.Error())
-				return err
-			}
-		}
 		dt := time.Now()
 		_, err := update.sqlStore.db.Exec(ctx, fmt.Sprintf(`CREATE TABLE staging_sessions_%d (
 			our_jid   VARCHAR(300),
@@ -696,11 +677,14 @@ func (s *SQLStore) IsTrustedIdentity(ctx context.Context, address string, key [3
 }
 
 const (
-	getSessionQuery       = `SELECT session FROM whatsmeow_sessions WITH (NOLOCK) WHERE our_jid=@p1 AND their_id=@p2`
-	sqliteHasSessionQuery = `SELECT true FROM whatsmeow_sessions WHERE our_jid=@p1 AND their_id=@p2`
-	mssqlHasSessionQuery  = `SELECT 1 FROM whatsmeow_sessions WITH (NOLOCK) WHERE our_jid=@p1 AND their_id=@p2`
-	mssqlHasDeviceManager = `SELECT 1 FROM whatsmeow_device WITH (NOLOCK) WHERE manager_id=@p1`
-	sqlitePutSessionQuery = `
+	getSessionQuery             = `SELECT session FROM whatsmeow_sessions WITH (NOLOCK) WHERE our_jid=@p1 AND their_id=@p2`
+	sqliteHasSessionQuery       = `SELECT true FROM whatsmeow_sessions WHERE our_jid=@p1 AND their_id=@p2`
+	mssqlHasSessionQuery        = `SELECT 1 FROM whatsmeow_sessions WITH (NOLOCK) WHERE our_jid=@p1 AND their_id=@p2`
+	mssqlHasDeviceManager       = `SELECT 1 FROM whatsmeow_device WITH (NOLOCK) WHERE manager_id=@p1`
+	getManySessionQueryPostgres = `SELECT their_id, session FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id = ANY($2)`
+	getManySessionQueryGeneric  = `SELECT their_id, session FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id IN (%s)`
+	getManySessionQueryMSSQL    = `SELECT their_id, session FROM whatsmeow_sessions WHERE our_jid=@p1 AND their_id IN (%s)`
+	sqlitePutSessionQuery       = `
 		INSERT INTO whatsmeow_sessions (our_jid, their_id, session) VALUES (@p1, @p2, @p3)
 		ON CONFLICT (our_jid, their_id) DO UPDATE SET session=excluded.session
 	`
@@ -801,6 +785,66 @@ func (s *SQLStore) HasSession(ctx context.Context, address string) (has bool, er
 		err = nil
 	}
 	return
+}
+
+type addressSessionTuple struct {
+	Address string
+	Session []byte
+}
+
+var sessionScanner = dbutil.ConvertRowFn[addressSessionTuple](func(row dbutil.Scannable) (out addressSessionTuple, err error) {
+	err = row.Scan(&out.Address, &out.Session)
+	return
+})
+
+func (s *SQLStore) GetManySessions(ctx context.Context, addresses []string) (map[string][]byte, error) {
+	if len(addresses) == 0 {
+		return nil, nil
+	}
+
+	var rows dbutil.Rows
+	var err error
+	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
+		rows, err = s.db.Query(ctx, getManySessionQueryPostgres, s.JID, PostgresArrayWrapper(addresses))
+	} else if s.db.Dialect == dbutil.MSSQL {
+		args := make([]any, len(addresses)+1)
+		placeholders := make([]string, len(addresses))
+		args[0] = s.JID
+		for i, addr := range addresses {
+			args[i+1] = addr
+			placeholders[i] = fmt.Sprintf("@p%d", i+2)
+		}
+		rows, err = s.db.Query(ctx, fmt.Sprintf(getManySessionQueryMSSQL, strings.Join(placeholders, ",")), args...)
+	} else {
+		args := make([]any, len(addresses)+1)
+		placeholders := make([]string, len(addresses))
+		args[0] = s.JID
+		for i, addr := range addresses {
+			args[i+1] = addr
+			placeholders[i] = fmt.Sprintf("$%d", i+2)
+		}
+		rows, err = s.db.Query(ctx, fmt.Sprintf(getManySessionQueryGeneric, strings.Join(placeholders, ",")), args...)
+	}
+	result := make(map[string][]byte, len(addresses))
+	for _, addr := range addresses {
+		result[addr] = nil
+	}
+	err = sessionScanner.NewRowIter(rows, err).Iter(func(tuple addressSessionTuple) (bool, error) {
+		result[tuple.Address] = tuple.Session
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
+	sessionChannel <- sessionBulkInsert{
+		sqlStore: s,
+		sessions: sessions,
+	}
+	return nil
 }
 
 func (s *SQLStore) PutSession(ctx context.Context, address string, session []byte) error {
@@ -1578,14 +1622,14 @@ const (
 				WHEN $2 LIKE '%@lid'
 					THEN (SELECT pn || '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid=replace($2, '@lid', ''))
 				WHEN $2 LIKE '%@s.whatsapp.net'
-					THEN (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE lid=replace($2, '@s.whatsapp.net', ''))
+					THEN (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE pn=replace($2, '@s.whatsapp.net', ''))
 			END
 		)) AND message_id=$4 AND (sender_jid=$3 OR sender_jid=(
 			CASE
 				WHEN $3 LIKE '%@lid'
 					THEN (SELECT pn || '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid=replace($3, '@lid', ''))
 				WHEN $3 LIKE '%@s.whatsapp.net'
-					THEN (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE lid=replace($3, '@s.whatsapp.net', ''))
+					THEN (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE pn=replace($3, '@s.whatsapp.net', ''))
 			END
 		))
 	`
@@ -1680,8 +1724,37 @@ const (
 			INSERT (our_jid, their_jid, token, timestamp_info)
 			VALUES (source.our_jid, source.their_jid, source.token, source.timestamp_info);
 	`
-	sqliteGetPrivacyToken = `SELECT token, timestamp FROM whatsmeow_privacy_tokens WHERE our_jid=@p1 AND their_jid=@p2`
-	mssqlGetPrivacyToken  = `SELECT token, timestamp_info FROM whatsmeow_privacy_tokens WITH (NOLOCK) WHERE our_jid=@p1 AND their_jid=@p2`
+	sqliteGetPrivacyToken = `
+		SELECT token, timestamp FROM whatsmeow_privacy_tokens WHERE our_jid=$1 AND (their_jid=$2 OR their_jid=(
+			CASE
+				WHEN $2 LIKE '%@lid'
+					THEN (SELECT pn || '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid=replace($2, '@lid', ''))
+				WHEN $2 LIKE '%@s.whatsapp.net'
+					THEN (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE pn=replace($2, '@s.whatsapp.net', ''))
+				ELSE $2
+			END
+		))
+		ORDER BY timestamp DESC LIMIT 1
+	`
+	mssqlGetPrivacyToken = `
+		SELECT TOP 1 token, timestamp
+		FROM whatsmeow_privacy_tokens
+		WHERE our_jid = @p1
+		  AND (their_jid = @p2 
+		       OR their_jid = 
+		          CASE 
+		              WHEN @p2 LIKE '%@lid' THEN 
+		                   (SELECT pn + '@s.whatsapp.net' 
+		                    FROM whatsmeow_lid_map 
+		                    WHERE lid = REPLACE(@p2, '@lid', ''))
+		              WHEN @p2 LIKE '%@s.whatsapp.net' THEN 
+		                   (SELECT lid + '@lid' 
+		                    FROM whatsmeow_lid_map 
+		                    WHERE pn = REPLACE(@p2, '@s.whatsapp.net', ''))
+		              ELSE @p2
+		          END
+		      )
+		ORDER BY timestamp DESC`
 )
 
 func (s *SQLStore) PutPrivacyTokens(ctx context.Context, tokens ...store.PrivacyToken) error {
@@ -1765,138 +1838,6 @@ const (
 	removeMessageNodeQuery    = `DELETE FROM whatsapp_message_node WHERE id=@p1`
 	removeOldMessageNodeQuery = `DELETE FROM whatsapp_message_node WHERE insert_timestamp < @p1`
 )
-
-func (s *SQLStore) CacheSessions(ctx context.Context, addresses []string) (final map[string][]byte) {
-	final = make(map[string][]byte)
-	if len(addresses) == 0 {
-		return final
-	}
-	query := getCacheSessionQuery + "("
-	queryParams := make([]interface{}, len(addresses)+1)
-	queryParams[0] = s.JID
-	for index, address := range addresses {
-		if index > 0 {
-			query += ","
-		}
-		query += fmt.Sprintf("@p%d", index+2)
-		queryParams[index+1] = address
-	}
-	query += ")"
-	rows, err := s.db.Query(ctx, query, queryParams...)
-	if err != nil {
-		s.log.Errorf(err.Error())
-		return
-	}
-	for rows.Next() {
-		var session []byte
-		var id string
-		rows.Scan(&id, &session)
-		final[id] = session
-	}
-	return
-}
-
-func (s *SQLStore) CacheIdentities(ctx context.Context, addresses []string) (final map[string][32]byte) {
-	final = make(map[string][32]byte)
-	if len(addresses) == 0 {
-		return final
-	}
-	query := getCacheIdentityQuery + "("
-	queryParams := make([]interface{}, len(addresses)+1)
-	queryParams[0] = s.JID
-	for index, address := range addresses {
-		if index > 0 {
-			query += ","
-		}
-		query += fmt.Sprintf("@p%d", index+2)
-		queryParams[index+1] = address
-	}
-	query += ")"
-	rows, err := s.db.Query(ctx, query, queryParams...)
-	if err != nil {
-		s.log.Errorf(err.Error())
-		return
-	}
-	for rows.Next() {
-		var session []byte
-		var id string
-		rows.Scan(&id, &session)
-		final[id] = *(*[32]byte)(session)
-	}
-	return
-}
-
-func (s *SQLStore) StoreSessions(ctx context.Context, sessions map[string][]byte, oldAddresses []string) {
-	sessionChannel <- sessionBulkInsert{
-		sqlStore:     s,
-		sessions:     sessions,
-		oldAddresses: oldAddresses,
-	}
-}
-
-func (s *SQLStore) StoreIdentities(ctx context.Context, identityKeys map[string][32]byte, oldAddresses []string) {
-	s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		if len(oldAddresses) > 0 {
-			query := removeIdentityKeysQuery + "("
-			queryParams := make([]interface{}, len(oldAddresses)+1)
-			queryParams[0] = s.JID
-			for index, address := range oldAddresses {
-				if index > 0 {
-					query += ","
-				}
-				query += fmt.Sprintf("@p%d", index+2)
-				queryParams[index+1] = address
-			}
-			query += ")"
-			_, err := s.db.Exec(ctx, query, queryParams...)
-			if err != nil {
-				s.log.Errorf("Could not Remove Identity Keys: " + err.Error())
-				return err
-			}
-		}
-		dt := time.Now()
-		_, err := s.db.Exec(ctx, fmt.Sprintf(`CREATE TABLE staging_identitykeys_%d (
-			our_jid  VARCHAR(300),
-			their_id VARCHAR(300),
-			identity_info VARBINARY(max) NOT NULL CHECK ( LEN(identity_info) = 32 ),
-		)`, dt.UnixMilli()))
-		if err != nil {
-			return fmt.Errorf("failed to create table: %w", err)
-		}
-		bulkImportStr := mssql.CopyIn(fmt.Sprintf("staging_identitykeys_%d", dt.UnixMilli()), mssql.BulkOptions{}, "our_jid", "their_id", "identity_info")
-		stmt, err := s.db.PrepareContext(ctx, bulkImportStr)
-		if err != nil {
-			s.log.Errorf("Could not Prepare Statement: " + err.Error())
-			return err
-		}
-		for address, identityInfo := range identityKeys {
-			stmt.Exec(s.JID, address, identityInfo[:])
-		}
-		_, err = stmt.Exec()
-		if err != nil {
-			s.log.Errorf("Could not Store Identity Keys: " + err.Error())
-			return err
-		}
-		_, err = s.db.Exec(ctx, fmt.Sprintf(`MERGE INTO whatsmeow_identity_keys AS target
-			USING staging_identitykeys_%d AS source
-			ON target.our_jid = source.our_jid AND target.their_id = source.their_id
-			WHEN MATCHED THEN
-				UPDATE SET target.identity_info = source.identity_info
-			WHEN NOT MATCHED THEN
-				INSERT (our_jid, their_id, identity_info)
-				VALUES (source.our_jid, source.their_id, source.identity_info);`, dt.UnixMilli()))
-		if err != nil {
-			s.log.Errorf("failed to merge bulk: " + err.Error())
-			return fmt.Errorf("failed to merge bulk: %w", err)
-		}
-		_, err = s.db.Exec(ctx, fmt.Sprintf("DROP TABLE staging_identitykeys_%d", dt.UnixMilli()))
-		if err != nil {
-			s.log.Errorf("failed to drop table: " + err.Error())
-			return fmt.Errorf("failed to drop table: %w", err)
-		}
-		return nil
-	})
-}
 
 func (s *SQLStore) PutMessageNode(ctx context.Context, user string, group *string, node *waBinary.Node) (err error) {
 	nodeData, err := json.Marshal(node)

@@ -36,10 +36,6 @@ func (device *Device) GetLocalRegistrationID() uint32 {
 
 func (device *Device) SaveIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) error {
 	addrString := address.String()
-	if device.IdentityCache != nil && len(device.IdentityCache) > 0 {
-		device.IdentityCache[addrString] = identityKey.PublicKey().PublicKey()
-		return nil
-	}
 	err := device.Identities.PutIdentity(ctx, addrString, identityKey.PublicKey().PublicKey())
 	if err != nil {
 		return fmt.Errorf("failed to save identity of %s: %w", addrString, err)
@@ -49,12 +45,6 @@ func (device *Device) SaveIdentity(ctx context.Context, address *protocol.Signal
 
 func (device *Device) IsTrustedIdentity(ctx context.Context, address *protocol.SignalAddress, identityKey *identity.Key) (bool, error) {
 	addrString := address.String()
-	if device.IdentityCache != nil && len(device.IdentityCache) > 0 {
-		if cache, ok := device.IdentityCache[addrString]; ok {
-			return cache == identityKey.PublicKey().PublicKey(), nil
-		}
-		return true, nil
-	}
 	isTrusted, err := device.Identities.IsTrustedIdentity(ctx, addrString, identityKey.PublicKey().PublicKey())
 	if err != nil {
 		return false, fmt.Errorf("failed to check if %s's identity is trusted: %w", addrString, err)
@@ -94,16 +84,10 @@ func (device *Device) ContainsPreKey(ctx context.Context, preKeyID uint32) (bool
 
 func (device *Device) LoadSession(ctx context.Context, address *protocol.SignalAddress) (*record.Session, error) {
 	addrString := address.String()
-	if device.SessionsCache != nil && len(device.SessionsCache) > 0 {
-		if rawSess, ok := device.SessionsCache[addrString]; ok {
-			sess, err := record.NewSessionFromBytes(rawSess, SignalProtobufSerializer.Session, SignalProtobufSerializer.State)
-			if err != nil {
-				return nil, fmt.Errorf("failed to deserialize session with %s: %w", addrString, err)
-			}
-			return sess, nil
-		}
-		return record.NewSession(SignalProtobufSerializer.Session, SignalProtobufSerializer.State), nil
+	if sess := getCachedSession(ctx, addrString); sess != nil {
+		return sess, nil
 	}
+
 	rawSess, err := device.Sessions.GetSession(ctx, addrString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load session with %s: %w", addrString, err)
@@ -124,10 +108,10 @@ func (device *Device) GetSubDeviceSessions(ctx context.Context, name string) ([]
 
 func (device *Device) StoreSession(ctx context.Context, address *protocol.SignalAddress, record *record.Session) error {
 	addrString := address.String()
-	if device.SessionsCache != nil && len(device.SessionsCache) > 0 {
-		device.SessionsCache[addrString] = record.Serialize()
+	if putCachedSession(ctx, addrString, record) {
 		return nil
 	}
+
 	err := device.Sessions.PutSession(ctx, addrString, record.Serialize())
 	if err != nil {
 		return fmt.Errorf("failed to store session with %s: %w", addrString, err)
@@ -137,12 +121,6 @@ func (device *Device) StoreSession(ctx context.Context, address *protocol.Signal
 
 func (device *Device) ContainsSession(ctx context.Context, remoteAddress *protocol.SignalAddress) (bool, error) {
 	addrString := remoteAddress.String()
-	if device.SessionsCache != nil && len(device.SessionsCache) > 0 {
-		if _, ok := device.SessionsCache[addrString]; ok {
-			return true, nil
-		}
-		return false, nil
-	}
 	hasSession, err := device.Sessions.HasSession(ctx, addrString)
 	if err != nil {
 		return false, fmt.Errorf("failed to check if store has session for %s: %w", addrString, err)
